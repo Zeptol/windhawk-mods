@@ -1,0 +1,266 @@
+// ==WindhawkMod==
+// @id              windows-11-china-holiday-calendar
+// @name            Windows 11 Native China Holiday Calendar
+// @name:zh-CN      Windows 11 原生中国节假日日历
+// @description     Automatically marks mainland China statutory holidays and make-up workdays in the native Windows 11 calendar, while preserving lunar/festival labels and selected-date header sync.
+// @description:zh-CN 在 Windows 11 原生日历中自动获取并标记中国法定节假日与调休，保留农历/节日显示，并让顶部日期随点击日期同步。
+// @version         1.0.1
+// @author          Zep
+// @github          https://github.com/zeptol
+// @include         ShellExperienceHost.exe
+// @architecture    x86-64
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject
+// @license         GPL-3.0
+// ==/WindhawkMod==
+
+// Source code is published under GNU GPL v3.0.
+
+// ==WindhawkModReadme==
+/*
+# Windows 11 原生中国节假日日历
+
+作者：**Zep**（GitHub: [@zeptol](https://github.com/zeptol)）
+
+直接增强 Windows 11 任务栏右下角的**系统原生日历**，不替换窗口、不启动独立日历。
+
+## 功能
+
+- 自动获取中国大陆法定节假日与调休安排，无需每年手工修改代码；
+- 法定休假日使用淡红色圆形底色，并显示小型 `休` 标记；
+- 调休工作日使用淡暖色圆形底色，并显示小型 `班` 标记；
+- 保留农历、传统节日和节气文字；
+- 点击任意日期后，顶部日期与农历/节日信息会同步到所选日期；
+- 日期数字本身仍由 Windows 原生样式绘制。
+
+## 节假日数据
+
+Mod 会按当前正在显示的年份自动联网读取 `NateScarlet/holiday-cn` 的年度 JSON 数据。
+该项目根据国务院节假日公告自动更新，并提供 `休息日 / 调休工作日` 标记。
+
+数据源：<https://github.com/NateScarlet/holiday-cn>
+
+为了兼容跨年调休，Mod 会同时检查当前年份和下一年份的数据。数据在运行期间定期刷新；成功获取的数据会写入 Windhawk 本地缓存，重启后可先使用缓存并在后台刷新。网络不可用时，已缓存数据以及内置的 2026 数据仍可作为回退。
+
+联网部分使用 Windhawk 1.5+ 提供的 `Wh_GetUrlContent` API，而不是直接从 `ShellExperienceHost.exe` 发起 WinINet 请求，从而避免打包系统进程的网络访问限制。
+
+## 兼容性说明
+
+本 Mod 使用 Windows XAML Diagnostics 访问系统原生 `CalendarView`。同一个 `ShellExperienceHost.exe` 进程同时只能有一个 XAML Diagnostics consumer，因此不要同时启用其它同样使用 XAML Diagnostics 修改通知中心/日历的 Mod。
+
+XAML Diagnostics / VisualTreeWatcher 引导结构参考了 m417z 的 Windows 11 Notification Center Styler，并按照 GPL-3.0 要求保留相应许可与致谢。
+*/
+// ==/WindhawkModReadme==
+
+#include <windows.h>
+#include <xamlom.h>
+#include <ocidl.h>
+#include <combaseapi.h>
+
+#include <atomic>
+#include <cwchar>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+// windows.h defines GetCurrentTime() as a macro for GetTickCount().
+// C++/WinRT has methods named GetCurrentTime with parameters, so the macro
+// must be removed after the Win32 headers and before the WinRT headers.
+#undef GetCurrentTime
+
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Globalization.h>
+#include <winrt/Windows.UI.h>
+#include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Markup.h>
+
+namespace wf = winrt::Windows::Foundation;
+namespace wux = winrt::Windows::UI::Xaml;
+namespace wxc = winrt::Windows::UI::Xaml::Controls;
+namespace wui = winrt::Windows::UI;
+namespace wg = winrt::Windows::Globalization;
+namespace wxmedia = winrt::Windows::UI::Xaml::Media;
+namespace wxm = winrt::Windows::UI::Xaml::Markup;
+
+// -----------------------------------------------------------------------------
+// Holiday model
+// -----------------------------------------------------------------------------
+
+enum class DayKind {
+    Normal,
+    Holiday,
+    MakeUpWorkday,
+};
+
+constexpr int DateKey(int year, int month, int day) {
+    return year * 10000 + month * 100 + day;
+}
+
+// -----------------------------------------------------------------------------
+// Automatic holiday data
+// -----------------------------------------------------------------------------
+//
+// Data source: NateScarlet/holiday-cn
+// https://github.com/NateScarlet/holiday-cn
+//
+// The repository's yearly JSON files are generated from State Council notices.
+// Per the repository documentation, December dates can be affected by the next
+// year's notice, so classification checks both <year>.json and <year+1>.json.
+
+struct HolidayYearState {
+    bool fetching = false;
+    bool fetchedSuccessfully = false;
+    bool cacheLoadAttempted = false;
+    ULONGLONG lastAttemptTick = 0;
+};
+
+SRWLOCK g_holidayDataLock = SRWLOCK_INIT;
+std::unordered_map<int, std::unordered_map<int, DayKind>> g_holidayDataBySourceYear;
+std::unordered_map<int, HolidayYearState> g_holidayYearStates;
+
+SRWLOCK g_fetchThreadsLock = SRWLOCK_INIT;
+std::vector<HANDLE> g_fetchThreads;
+std::atomic<bool> g_stopping{false};
+
+constexpr ULONGLONG kSuccessfulRefreshMs = 12ULL * 60 * 60 * 1000;
+constexpr ULONGLONG kFailedRetryMs = 15ULL * 60 * 1000;
+
+void RefreshAllCalendarsAcrossThreads();
+
+void InitializeBuiltIn2026Fallback() {
+    std::unordered_map<int, DayKind> days;
+
+    const int workdays[] = {
+        20260104, 20260214, 20260228, 20260509, 20260920, 20261010,
+    };
+    for (int key : workdays) {
+        days[key] = DayKind::MakeUpWorkday;
+    }
+
+    const int holidays[] = {
+        20260101, 20260102, 20260103,
+        20260215, 20260216, 20260217, 20260218, 20260219,
+        20260220, 20260221, 20260222, 20260223,
+        20260404, 20260405, 20260406,
+        20260501, 20260502, 20260503, 20260504, 20260505,
+        20260619, 20260620, 20260621,
+        20260925, 20260926, 20260927,
+        20261001, 20261002, 20261003, 20261004,
+        20261005, 20261006, 20261007,
+    };
+    for (int key : holidays) {
+        days[key] = DayKind::Holiday;
+    }
+
+    AcquireSRWLockExclusive(&g_holidayDataLock);
+    g_holidayDataBySourceYear[2026] = std::move(days);
+    // Deliberately don't mark 2026 as successfully fetched: the online source
+    // should still refresh/override the fallback as soon as possible.
+    ReleaseSRWLockExclusive(&g_holidayDataLock);
+}
+
+bool ParseIsoDateKey(std::string const& value, int* key) {
+    if (value.size() != 10 || value[4] != '-' || value[7] != '-') {
+        return false;
+    }
+
+    auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    if (!digit(value[0]) || !digit(value[1]) || !digit(value[2]) ||
+        !digit(value[3]) || !digit(value[5]) || !digit(value[6]) ||
+        !digit(value[8]) || !digit(value[9])) {
+        return false;
+    }
+
+    const int year = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
+                     (value[2] - '0') * 10 + (value[3] - '0');
+    const int month = (value[5] - '0') * 10 + (value[6] - '0');
+    const int day = (value[8] - '0') * 10 + (value[9] - '0');
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+        return false;
+    }
+
+    *key = DateKey(year, month, day);
+    return true;
+}
+
+bool ParseHolidayJson(std::string const& json,
+                      std::unordered_map<int, DayKind>* result) {
+    result->clear();
+
+    const size_t daysPos = json.find("\"days\"");
+    if (daysPos == std::string::npos) {
+        return false;
+    }
+
+    size_t pos = daysPos;
+    while (true) {
+        const size_t dateKeyPos = json.find("\"date\"", pos);
+        if (dateKeyPos == std::string::npos) {
+            break;
+        }
+
+        const size_t objectEnd = json.find('}', dateKeyPos);
+        if (objectEnd == std::string::npos) {
+            return false;
+        }
+
+        const size_t colon = json.find(':', dateKeyPos);
+        const size_t quote1 = colon == std::string::npos
+                                  ? std::string::npos
+                                  : json.find('"', colon + 1);
+        const size_t quote2 = quote1 == std::string::npos
+                                  ? std::string::npos
+                                  : json.find('"', quote1 + 1);
+        if (quote1 == std::string::npos || quote2 == std::string::npos ||
+            quote2 > objectEnd) {
+            pos = objectEnd + 1;
+            continue;
+        }
+
+        int date = 0;
+        if (!ParseIsoDateKey(json.substr(quote1 + 1, quote2 - quote1 - 1),
+                             &date)) {
+            pos = objectEnd + 1;
+            continue;
+        }
+
+        const size_t offKeyPos = json.find("\"isOffDay\"", quote2);
+        if (offKeyPos == std::string::npos || offKeyPos > objectEnd) {
+            pos = objectEnd + 1;
+            continue;
+        }
+
+        const size_t offColon = json.find(':', offKeyPos);
+        if (offColon == std::string::npos || offColon > objectEnd) {
+            pos = objectEnd + 1;
+            continue;
+        }
+
+        size_t valuePos = offColon + 1;
+        while (valuePos < objectEnd &&
+               (json[valuePos] == ' ' || json[valuePos] == '\t' ||
+                json[valuePos] == '\r' || json[valuePos] == '\n')) {
+            valuePos++;
+        }
+
+        if (json.compare(valuePos, 4, "true") == 0) {
+            (*result)[date] = DayKind::Holiday;
+        } else if (json.compare(valuePos, 5, "false") == 0) {
+            (*result)[date] = DayKind::MakeUpWorkday;
+        }
+
+        pos = objectEnd + 1;
+    }
+
+    // An empty `days` array is valid (for example, the next year's file before
+    // the State Council publishes its schedule), so presence of the field is
+    // enough to consider the JSON valid.
+    return true;
+}
+
+std::wstring CacheDataKey(int year) {
