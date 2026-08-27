@@ -1,0 +1,324 @@
+    return L"holiday-cache-data-" + std::to_wstring(year);
+}
+
+std::wstring CacheSizeKey(int year) {
+    return L"holiday-cache-size-" + std::to_wstring(year);
+}
+
+bool SaveHolidayCache(int year, std::string const& json) {
+    if (json.empty() || json.size() > 1024 * 1024) {
+        return false;
+    }
+
+    const auto dataKey = CacheDataKey(year);
+    const auto sizeKey = CacheSizeKey(year);
+
+    if (!Wh_SetBinaryValue(dataKey.c_str(), json.data(), json.size())) {
+        return false;
+    }
+
+    if (!Wh_SetIntValue(sizeKey.c_str(), static_cast<int>(json.size()))) {
+        return false;
+    }
+
+    return true;
+}
+
+bool LoadHolidayCache(int year,
+                      std::unordered_map<int, DayKind>* parsed) {
+    const auto dataKey = CacheDataKey(year);
+    const auto sizeKey = CacheSizeKey(year);
+
+    const int storedSize = Wh_GetIntValue(sizeKey.c_str(), 0);
+    if (storedSize <= 0 || storedSize > 1024 * 1024) {
+        return false;
+    }
+
+    std::string json(static_cast<size_t>(storedSize), '\0');
+    const size_t bytesRead =
+        Wh_GetBinaryValue(dataKey.c_str(), json.data(), json.size());
+    if (bytesRead != json.size()) {
+        return false;
+    }
+
+    return ParseHolidayJson(json, parsed);
+}
+
+bool WindhawkGet(std::wstring const& url,
+                 std::string* body,
+                 int* statusCode) {
+    body->clear();
+    if (statusCode) {
+        *statusCode = 0;
+    }
+
+    // Wh_GetUrlContent is the Windhawk-native networking API (Windhawk 1.5+).
+    // Using it is more reliable for a mod injected into packaged system
+    // processes such as ShellExperienceHost.exe than issuing WinINet requests
+    // directly from that process.
+    const WH_URL_CONTENT* content = Wh_GetUrlContent(url.c_str(), nullptr);
+    if (!content) {
+        return false;
+    }
+
+    const int status = content->statusCode;
+    if (statusCode) {
+        *statusCode = status;
+    }
+
+    bool ok = status == 200 && content->data != nullptr;
+    if (ok) {
+        body->assign(content->data, content->length);
+    }
+
+    Wh_FreeUrlContent(content);
+    return ok;
+}
+
+bool DownloadHolidayYear(int year,
+                         std::string* json,
+                         wchar_t const** sourceName) {
+    const std::wstring suffix = std::to_wstring(year) + L".json";
+
+    struct Endpoint {
+        wchar_t const* name;
+        std::wstring url;
+    };
+
+    const Endpoint endpoints[] = {
+        {
+            L"jsDelivr",
+            L"https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/" +
+                suffix,
+        },
+        {
+            L"Fastly jsDelivr",
+            L"https://fastly.jsdelivr.net/gh/NateScarlet/holiday-cn@master/" +
+                suffix,
+        },
+        {
+            L"GitHub Raw",
+            L"https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/" +
+                suffix,
+        },
+    };
+
+    for (auto const& endpoint : endpoints) {
+        int status = 0;
+        if (WindhawkGet(endpoint.url, json, &status)) {
+            if (sourceName) {
+                *sourceName = endpoint.name;
+            }
+            return true;
+        }
+
+        if (status != 0) {
+            Wh_Log(L"Holiday data %d: %s returned HTTP %d",
+                   year,
+                   endpoint.name,
+                   status);
+        } else {
+            Wh_Log(L"Holiday data %d: %s request failed",
+                   year,
+                   endpoint.name);
+        }
+    }
+
+    if (sourceName) {
+        *sourceName = L"";
+    }
+    return false;
+}
+
+struct HolidayFetchParam {
+    int sourceYear;
+};
+
+DWORD WINAPI HolidayFetchThreadProc(LPVOID rawParam) {
+    std::unique_ptr<HolidayFetchParam> param(
+        static_cast<HolidayFetchParam*>(rawParam));
+    const int sourceYear = param->sourceYear;
+
+    std::string json;
+    std::unordered_map<int, DayKind> parsed;
+    wchar_t const* sourceName = L"";
+    const bool downloaded =
+        DownloadHolidayYear(sourceYear, &json, &sourceName);
+    const bool parsedOk = downloaded && ParseHolidayJson(json, &parsed);
+
+    AcquireSRWLockExclusive(&g_holidayDataLock);
+    auto& state = g_holidayYearStates[sourceYear];
+    state.fetching = false;
+    if (parsedOk) {
+        g_holidayDataBySourceYear[sourceYear] = parsed;
+        state.fetchedSuccessfully = true;
+    }
+    ReleaseSRWLockExclusive(&g_holidayDataLock);
+
+    if (parsedOk) {
+        const bool cacheSaved = SaveHolidayCache(sourceYear, json);
+        Wh_Log(L"Holiday data %d refreshed via %s (%u entries, cache=%s)",
+               sourceYear,
+               sourceName,
+               static_cast<unsigned>(parsed.size()),
+               cacheSaved ? L"saved" : L"not-saved");
+
+        if (!g_stopping.load()) {
+            RefreshAllCalendarsAcrossThreads();
+        }
+    } else {
+        if (downloaded) {
+            Wh_Log(L"Holiday data %d downloaded but JSON parsing failed; "
+                   L"existing/cache/fallback data kept",
+                   sourceYear);
+        } else {
+            Wh_Log(L"Holiday data %d refresh failed; "
+                   L"existing/cache/fallback data kept",
+                   sourceYear);
+        }
+    }
+
+    return 0;
+}
+
+void EnsureHolidaySourceYearAsync(int sourceYear) {
+    // holiday-cn currently starts at 2014. Avoid pointless network requests for
+    // very old calendar pages or absurd future years.
+    if (sourceYear < 2014 || sourceYear > 2100 || g_stopping.load()) {
+        return;
+    }
+
+    bool shouldLoadCache = false;
+    AcquireSRWLockExclusive(&g_holidayDataLock);
+    {
+        auto& state = g_holidayYearStates[sourceYear];
+        if (!state.cacheLoadAttempted) {
+            state.cacheLoadAttempted = true;
+            shouldLoadCache = true;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_holidayDataLock);
+
+    if (shouldLoadCache) {
+        std::unordered_map<int, DayKind> cached;
+        if (LoadHolidayCache(sourceYear, &cached)) {
+            const auto cachedCount = cached.size();
+            AcquireSRWLockExclusive(&g_holidayDataLock);
+            g_holidayDataBySourceYear[sourceYear] = std::move(cached);
+            ReleaseSRWLockExclusive(&g_holidayDataLock);
+
+            Wh_Log(L"Holiday data %d loaded from persistent cache (%u entries)",
+                   sourceYear,
+                   static_cast<unsigned>(cachedCount));
+        }
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    bool shouldStart = false;
+
+    AcquireSRWLockExclusive(&g_holidayDataLock);
+    auto& state = g_holidayYearStates[sourceYear];
+    const ULONGLONG retryInterval = state.fetchedSuccessfully
+                                        ? kSuccessfulRefreshMs
+                                        : kFailedRetryMs;
+    if (!state.fetching &&
+        (state.lastAttemptTick == 0 ||
+         now - state.lastAttemptTick >= retryInterval)) {
+        state.fetching = true;
+        state.lastAttemptTick = now;
+        shouldStart = true;
+    }
+    ReleaseSRWLockExclusive(&g_holidayDataLock);
+
+    if (!shouldStart) {
+        return;
+    }
+
+    auto param = std::make_unique<HolidayFetchParam>();
+    param->sourceYear = sourceYear;
+
+    // Create suspended so Wh_ModUninit can't miss a just-created worker before
+    // its handle is registered in g_fetchThreads.
+    HANDLE thread = CreateThread(nullptr,
+                                 0,
+                                 HolidayFetchThreadProc,
+                                 param.get(),
+                                 CREATE_SUSPENDED,
+                                 nullptr);
+    if (!thread) {
+        AcquireSRWLockExclusive(&g_holidayDataLock);
+        g_holidayYearStates[sourceYear].fetching = false;
+        ReleaseSRWLockExclusive(&g_holidayDataLock);
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_fetchThreadsLock);
+    if (g_stopping.load()) {
+        ReleaseSRWLockExclusive(&g_fetchThreadsLock);
+        CloseHandle(thread);
+        AcquireSRWLockExclusive(&g_holidayDataLock);
+        g_holidayYearStates[sourceYear].fetching = false;
+        ReleaseSRWLockExclusive(&g_holidayDataLock);
+        return;
+    }
+
+    g_fetchThreads.push_back(thread);
+    param.release();
+    ReleaseSRWLockExclusive(&g_fetchThreadsLock);
+    ResumeThread(thread);
+}
+
+void EnsureHolidayDataForDate(int year) {
+    EnsureHolidaySourceYearAsync(year);
+    // holiday-cn documents that December dates can be affected by the following
+    // year's State Council notice. Loading both also makes cross-year schedules
+    // update automatically without a new mod release.
+    EnsureHolidaySourceYearAsync(year + 1);
+}
+
+DayKind ClassifyDate(int year, int month, int day) {
+    const int key = DateKey(year, month, day);
+    DayKind result = DayKind::Normal;
+
+    AcquireSRWLockShared(&g_holidayDataLock);
+
+    // Prefer the following year's file if it contains this exact date, matching
+    // holiday-cn's recommendation for cross-year adjustments.
+    if (auto nextIt = g_holidayDataBySourceYear.find(year + 1);
+        nextIt != g_holidayDataBySourceYear.end()) {
+        if (auto dayIt = nextIt->second.find(key); dayIt != nextIt->second.end()) {
+            result = dayIt->second;
+        }
+    }
+
+    if (result == DayKind::Normal) {
+        if (auto yearIt = g_holidayDataBySourceYear.find(year);
+            yearIt != g_holidayDataBySourceYear.end()) {
+            if (auto dayIt = yearIt->second.find(key);
+                dayIt != yearIt->second.end()) {
+                result = dayIt->second;
+            }
+        }
+    }
+
+    ReleaseSRWLockShared(&g_holidayDataLock);
+    return result;
+}
+
+void StopHolidayWorkers() {
+    g_stopping = true;
+
+    std::vector<HANDLE> threads;
+    AcquireSRWLockExclusive(&g_fetchThreadsLock);
+    threads.swap(g_fetchThreads);
+    ReleaseSRWLockExclusive(&g_fetchThreadsLock);
+
+    for (HANDLE thread : threads) {
+        if (thread) {
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+        }
+    }
+}
+
+bool DateTimeToYmd(wf::DateTime const& dateTime, int* year, int* month, int* day) {
