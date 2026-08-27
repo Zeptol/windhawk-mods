@@ -1,0 +1,388 @@
+            m_site.copy_from(unknownSite);
+            if (m_site) {
+                // Balance the module refcount added by InitializeXamlDiagnosticsEx.
+                FreeLibrary(GetCurrentModuleHandle());
+                g_visualTreeWatcher =
+                    winrt::make_self<VisualTreeWatcher>(m_site);
+            }
+            return S_OK;
+        } catch (...) {
+            const HRESULT hr = winrt::to_hresult();
+            Wh_Log(L"WindhawkHolidayTAP::SetSite failed: %08X", hr);
+            return hr;
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE GetSite(REFIID riid, void** site) noexcept override {
+        return m_site.as(riid, site);
+    }
+
+private:
+    winrt::com_ptr<IUnknown> m_site;
+};
+
+template <class T>
+struct SimpleFactory
+    : winrt::implements<SimpleFactory<T>, IClassFactory, winrt::non_agile> {
+    HRESULT STDMETHODCALLTYPE CreateInstance(
+        IUnknown* outer,
+        REFIID riid,
+        void** object) override {
+        try {
+            if (outer) {
+                return CLASS_E_NOAGGREGATION;
+            }
+            *object = nullptr;
+            return winrt::make<T>().as(riid, object);
+        } catch (...) {
+            return winrt::to_hresult();
+        }
+    }
+
+    HRESULT STDMETHODCALLTYPE LockServer(BOOL) noexcept override {
+        return S_OK;
+    }
+};
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdll-attribute-on-redeclaration"
+
+__declspec(dllexport) STDAPI DllGetClassObject(
+    REFCLSID clsid,
+    REFIID riid,
+    LPVOID* object) {
+    try {
+        if (clsid != CLSID_WindhawkHolidayTAP) {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        }
+        *object = nullptr;
+        return winrt::make<SimpleFactory<WindhawkHolidayTAP>>()
+            .as(riid, object);
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+}
+
+__declspec(dllexport) STDAPI DllCanUnloadNow() {
+    return winrt::get_module_lock() ? S_FALSE : S_OK;
+}
+
+#pragma clang diagnostic pop
+
+using PFN_INITIALIZE_XAML_DIAGNOSTICS_EX =
+    decltype(&InitializeXamlDiagnosticsEx);
+
+HRESULT InjectWindhawkHolidayTAP() noexcept {
+    HMODULE module = GetCurrentModuleHandle();
+    if (!module) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    WCHAR location[MAX_PATH];
+    switch (GetModuleFileNameW(module, location, ARRAYSIZE(location))) {
+        case 0:
+        case ARRAYSIZE(location):
+            return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    HMODULE xamlModule = LoadLibraryExW(
+        L"Windows.UI.Xaml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!xamlModule) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    auto initializeXamlDiagnosticsEx =
+        reinterpret_cast<PFN_INITIALIZE_XAML_DIAGNOSTICS_EX>(
+            GetProcAddress(xamlModule, "InitializeXamlDiagnosticsEx"));
+    if (!initializeXamlDiagnosticsEx) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    HRESULT hr = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    for (int i = 0; i < 10000; i++) {
+        WCHAR connectionName[64];
+        wsprintfW(connectionName, L"VisualDiagConnection%d", i + 1);
+
+        hr = initializeXamlDiagnosticsEx(
+            connectionName,
+            GetCurrentProcessId(),
+            L"",
+            location,
+            CLSID_WindhawkHolidayTAP,
+            nullptr);
+
+        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+            break;
+        }
+    }
+
+    return hr;
+}
+
+std::atomic<bool> g_tapInitialized{false};
+
+void EnsureTapInitialized() {
+    if (g_tapInitialized.exchange(true)) {
+        return;
+    }
+
+    const HRESULT hr = InjectWindhawkHolidayTAP();
+    if (FAILED(hr)) {
+        g_tapInitialized = false;
+        Wh_Log(L"InitializeXamlDiagnosticsEx failed: %08X", hr);
+    } else {
+        Wh_Log(L"XAML Diagnostics initialized");
+    }
+}
+
+void UninitializeTap() {
+    if (g_visualTreeWatcher) {
+        g_visualTreeWatcher->UnadviseVisualTreeChange();
+        g_visualTreeWatcher = nullptr;
+    }
+    g_tapInitialized = false;
+}
+
+// -----------------------------------------------------------------------------
+// Run cleanup on the native calendar UI thread.
+// -----------------------------------------------------------------------------
+
+using RunFromWindowThreadProc = void(WINAPI*)(PVOID parameter);
+
+bool RunFromWindowThread(HWND window,
+                         RunFromWindowThreadProc proc,
+                         PVOID procParam) {
+    static const UINT message =
+        RegisterWindowMessageW(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+
+    struct Param {
+        RunFromWindowThreadProc proc;
+        PVOID procParam;
+    };
+
+    const DWORD threadId = GetWindowThreadProcessId(window, nullptr);
+    if (!threadId) {
+        return false;
+    }
+
+    if (threadId == GetCurrentThreadId()) {
+        proc(procParam);
+        return true;
+    }
+
+    HHOOK hook = SetWindowsHookExW(
+        WH_CALLWNDPROC,
+        [](int code, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (code == HC_ACTION) {
+                auto cwp = reinterpret_cast<CWPSTRUCT*>(lParam);
+                if (cwp->message == message) {
+                    auto param = reinterpret_cast<Param*>(cwp->lParam);
+                    param->proc(param->procParam);
+                }
+            }
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        },
+        nullptr,
+        threadId);
+
+    if (!hook) {
+        return false;
+    }
+
+    Param param{proc, procParam};
+    SendMessageW(window, message, 0, reinterpret_cast<LPARAM>(&param));
+    UnhookWindowsHookEx(hook);
+    return true;
+}
+
+std::vector<HWND> GetCoreWindows() {
+    std::vector<HWND> windows;
+
+    EnumWindows(
+        [](HWND window, LPARAM lParam) -> BOOL {
+            DWORD processId = 0;
+            if (!GetWindowThreadProcessId(window, &processId) ||
+                processId != GetCurrentProcessId()) {
+                return TRUE;
+            }
+
+            WCHAR className[64]{};
+            if (!GetClassNameW(window, className, ARRAYSIZE(className))) {
+                return TRUE;
+            }
+
+            if (_wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
+                reinterpret_cast<std::vector<HWND>*>(lParam)->push_back(window);
+            }
+
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&windows));
+
+    return windows;
+}
+
+void RefreshAllCalendarsAcrossThreads() {
+    if (g_stopping.load()) {
+        return;
+    }
+
+    for (HWND window : GetCoreWindows()) {
+        RunFromWindowThread(
+            window,
+            [](PVOID) { RefreshAllCalendarsForCurrentThread(); },
+            nullptr);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Catch creation of the ShellExperienceHost CoreWindow so the mod also works
+// when ShellExperienceHost starts after Windhawk injects us.
+// -----------------------------------------------------------------------------
+
+bool IsCoreWindowClass(LPCWSTR className) {
+    if (!className) {
+        return false;
+    }
+
+    const BOOL textual =
+        ((ULONG_PTR)className & ~(ULONG_PTR)0xffff) != 0;
+    return textual &&
+           _wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0;
+}
+
+using CreateWindowInBand_t = HWND(WINAPI*)(
+    DWORD,
+    LPCWSTR,
+    LPCWSTR,
+    DWORD,
+    int,
+    int,
+    int,
+    int,
+    HWND,
+    HMENU,
+    HINSTANCE,
+    PVOID,
+    DWORD);
+
+CreateWindowInBand_t CreateWindowInBand_Original = nullptr;
+
+HWND WINAPI CreateWindowInBand_Hook(
+    DWORD exStyle,
+    LPCWSTR className,
+    LPCWSTR windowName,
+    DWORD style,
+    int x,
+    int y,
+    int width,
+    int height,
+    HWND parent,
+    HMENU menu,
+    HINSTANCE instance,
+    PVOID param,
+    DWORD band) {
+    HWND window = CreateWindowInBand_Original(
+        exStyle,
+        className,
+        windowName,
+        style,
+        x,
+        y,
+        width,
+        height,
+        parent,
+        menu,
+        instance,
+        param,
+        band);
+
+    if (window && IsCoreWindowClass(className)) {
+        EnsureTapInitialized();
+    }
+
+    return window;
+}
+
+using CreateWindowInBandEx_t = HWND(WINAPI*)(
+    DWORD,
+    LPCWSTR,
+    LPCWSTR,
+    DWORD,
+    int,
+    int,
+    int,
+    int,
+    HWND,
+    HMENU,
+    HINSTANCE,
+    PVOID,
+    DWORD,
+    DWORD);
+
+CreateWindowInBandEx_t CreateWindowInBandEx_Original = nullptr;
+
+HWND WINAPI CreateWindowInBandEx_Hook(
+    DWORD exStyle,
+    LPCWSTR className,
+    LPCWSTR windowName,
+    DWORD style,
+    int x,
+    int y,
+    int width,
+    int height,
+    HWND parent,
+    HMENU menu,
+    HINSTANCE instance,
+    PVOID param,
+    DWORD band,
+    DWORD typeFlags) {
+    HWND window = CreateWindowInBandEx_Original(
+        exStyle,
+        className,
+        windowName,
+        style,
+        x,
+        y,
+        width,
+        height,
+        parent,
+        menu,
+        instance,
+        param,
+        band,
+        typeFlags);
+
+    if (window && IsCoreWindowClass(className)) {
+        EnsureTapInitialized();
+    }
+
+    return window;
+}
+
+// -----------------------------------------------------------------------------
+// Windhawk entry points
+// -----------------------------------------------------------------------------
+
+BOOL Wh_ModInit() {
+    Wh_Log(L"Initializing native China holiday calendar v1.0.1");
+
+    g_stopping = false;
+    InitializeBuiltIn2026Fallback();
+
+    HMODULE user32 =
+        LoadLibraryExW(L"user32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (user32) {
+        if (void* createWindowInBand =
+                reinterpret_cast<void*>(
+                    GetProcAddress(user32, "CreateWindowInBand"))) {
+            Wh_SetFunctionHook(
+                createWindowInBand,
+                reinterpret_cast<void*>(CreateWindowInBand_Hook),
+                reinterpret_cast<void**>(&CreateWindowInBand_Original));
+        }
+
+        if (void* createWindowInBandEx =
+                reinterpret_cast<void*>(
+                    GetProcAddress(user32, "CreateWindowInBandEx"))) {
+            Wh_SetFunctionHook(
