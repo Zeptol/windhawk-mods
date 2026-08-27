@@ -1,0 +1,309 @@
+    // C++/WinRT DateTime uses the same 100 ns / 1601 epoch as FILETIME.
+    // CalendarView dates are interpreted in the user's local time zone. Convert
+    // through local time before taking Y/M/D so UTC+8 (and other zones) don't
+    // accidentally classify the previous/next day.
+    const auto rawTicks = dateTime.time_since_epoch().count();
+    if (rawTicks < 0) {
+        return false;
+    }
+
+    ULARGE_INTEGER ticks{};
+    ticks.QuadPart = static_cast<ULONGLONG>(rawTicks);
+
+    FILETIME ft{};
+    ft.dwLowDateTime = ticks.LowPart;
+    ft.dwHighDateTime = ticks.HighPart;
+
+    SYSTEMTIME utc{};
+    if (!FileTimeToSystemTime(&ft, &utc)) {
+        return false;
+    }
+
+    SYSTEMTIME local{};
+    if (!SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) {
+        local = utc;
+    }
+
+    *year = local.wYear;
+    *month = local.wMonth;
+    *day = local.wDay;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Native CalendarView styling + selected-date header sync
+// -----------------------------------------------------------------------------
+
+thread_local std::unordered_map<std::wstring, wxc::ControlTemplate> g_dayTemplates;
+
+wxc::ControlTemplate LoadTemplate(std::wstring const& xaml) {
+    return wxm::XamlReader::Load(winrt::hstring{xaml}).as<wxc::ControlTemplate>();
+}
+
+std::wstring EscapeXamlText(std::wstring value) {
+    std::wstring out;
+    out.reserve(value.size() + 8);
+    for (wchar_t ch : value) {
+        switch (ch) {
+            case L'&': out += L"&amp;"; break;
+            case L'<': out += L"&lt;"; break;
+            case L'>': out += L"&gt;"; break;
+            case L'\"': out += L"&quot;"; break;
+            default: out += ch; break;
+        }
+    }
+    return out;
+}
+
+std::wstring SolarFestivalName(int month, int day);
+std::wstring LunarFestivalName(int month, int day);
+std::wstring LunarDayText(int day);
+
+std::wstring SolarTermName2026(int year, int month, int day) {
+    if (year != 2026) {
+        return L"";
+    }
+
+    switch (DateKey(year, month, day)) {
+        case 20260105: return L"小寒";
+        case 20260120: return L"大寒";
+        case 20260204: return L"立春";
+        case 20260218: return L"雨水";
+        case 20260305: return L"惊蛰";
+        case 20260320: return L"春分";
+        case 20260405: return L"清明";
+        case 20260420: return L"谷雨";
+        case 20260505: return L"立夏";
+        case 20260521: return L"小满";
+        case 20260605: return L"芒种";
+        case 20260621: return L"夏至";
+        case 20260707: return L"小暑";
+        case 20260723: return L"大暑";
+        case 20260807: return L"立秋";
+        case 20260823: return L"处暑";
+        case 20260907: return L"白露";
+        case 20260923: return L"秋分";
+        case 20261008: return L"寒露";
+        case 20261023: return L"霜降";
+        case 20261107: return L"立冬";
+        case 20261122: return L"小雪";
+        case 20261207: return L"大雪";
+        case 20261222: return L"冬至";
+    }
+
+    return L"";
+}
+
+struct DaySecondaryInfo {
+    std::wstring text;
+    bool special = false;
+};
+
+DaySecondaryInfo GetDaySecondaryInfo(wf::DateTime const& dateTime) {
+    SYSTEMTIME st{};
+
+    const auto rawTicks = dateTime.time_since_epoch().count();
+    if (rawTicks < 0) {
+        return {};
+    }
+
+    ULARGE_INTEGER ticks{};
+    ticks.QuadPart = static_cast<ULONGLONG>(rawTicks);
+    FILETIME ft{};
+    ft.dwLowDateTime = ticks.LowPart;
+    ft.dwHighDateTime = ticks.HighPart;
+
+    SYSTEMTIME utc{};
+    if (!FileTimeToSystemTime(&ft, &utc)) {
+        return {};
+    }
+    if (!SystemTimeToTzSpecificLocalTime(nullptr, &utc, &st)) {
+        st = utc;
+    }
+
+    if (auto solar = SolarFestivalName(st.wMonth, st.wDay); !solar.empty()) {
+        return {solar, true};
+    }
+
+    if (auto term = SolarTermName2026(st.wYear, st.wMonth, st.wDay); !term.empty()) {
+        return {term, true};
+    }
+
+    // 2026 Lunar New Year's Eve. Windows normally shows 除夕 instead of a
+    // generic lunar day on this cell.
+    if (DateKey(st.wYear, st.wMonth, st.wDay) == 20260216) {
+        return {L"除夕", true};
+    }
+
+    try {
+        wg::Calendar lunar;
+        lunar.ChangeCalendarSystem(wg::CalendarIdentifiers::ChineseLunar());
+        lunar.SetDateTime(dateTime);
+
+        const int lunarMonth = lunar.Month();
+        const int lunarDay = lunar.Day();
+
+        if (auto festival = LunarFestivalName(lunarMonth, lunarDay);
+            !festival.empty()) {
+            return {festival, true};
+        }
+
+        return {LunarDayText(lunarDay), false};
+    } catch (...) {
+        return {};
+    }
+}
+
+wxc::ControlTemplate DayTemplate(DayKind kind,
+                                 std::wstring const& secondaryText,
+                                 bool specialSecondary) {
+    const wchar_t* kindKey = kind == DayKind::Holiday ? L"H" : L"W";
+    std::wstring key = kindKey;
+    key += specialSecondary ? L"|S|" : L"|N|";
+    key += secondaryText;
+
+    if (auto it = g_dayTemplates.find(key); it != g_dayTemplates.end()) {
+        return it->second;
+    }
+
+    const wchar_t* circle =
+        kind == DayKind::Holiday ? L"#22FF4D4F" : L"#18D99A35";
+    const wchar_t* badge =
+        kind == DayKind::Holiday ? L"#FFF04444" : L"#FF5D6B82";
+    const wchar_t* badgeText =
+        kind == DayKind::Holiday ? L"休" : L"班";
+
+    // Keep generic lunar text quiet. Festival/solar-term text gets a little more
+    // emphasis, but never a background of its own.
+    const wchar_t* secondaryForeground = specialSecondary
+        ? (kind == DayKind::Holiday ? L"#FFD94A4A" : L"#FF677386")
+        : L"#FF777777";
+
+    std::wstring xaml = LR"xaml(
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 TargetType="CalendarViewDayItem">
+    <Grid IsHitTestVisible="False">
+        <!-- Full, soft status circle. It sits below the native Gregorian number. -->
+        <Border Background=")xaml";
+    xaml += circle;
+    xaml += LR"xaml("
+                Width="36"
+                Height="36"
+                CornerRadius="18"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"/>
+
+        <!-- Restore the line that ShellExperienceHost drops when a local template
+             is applied. No background, no pill: just the lunar/festival/term text. -->
+        <TextBlock Text=")xaml";
+    xaml += EscapeXamlText(secondaryText);
+    xaml += LR"xaml("
+                   Foreground=")xaml";
+    xaml += secondaryForeground;
+    xaml += LR"xaml("
+                   FontSize="9"
+                   FontWeight="Normal"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Bottom"
+                   Margin="0,0,0,1"/>
+
+        <!-- Plain text marker, intentionally inset so it isn't clipped. -->
+        <TextBlock Text=")xaml";
+    xaml += badgeText;
+    xaml += LR"xaml("
+                   Foreground=")xaml";
+    xaml += badge;
+    xaml += LR"xaml("
+                   FontSize="8"
+                   FontWeight="SemiBold"
+                   HorizontalAlignment="Right"
+                   VerticalAlignment="Top"
+                   Margin="0,2,3,0"/>
+    </Grid>
+</ControlTemplate>)xaml";
+
+    auto loaded = LoadTemplate(xaml);
+    g_dayTemplates.emplace(key, loaded);
+    return loaded;
+}
+
+thread_local std::vector<wxc::CalendarViewDayItem> g_touchedDayItems;
+
+void RememberTouchedItem(wxc::CalendarViewDayItem const& item) {
+    void* abi = winrt::get_abi(item);
+    for (auto const& existing : g_touchedDayItems) {
+        if (winrt::get_abi(existing) == abi) {
+            return;
+        }
+    }
+    g_touchedDayItems.push_back(item);
+}
+
+void RestoreTouchedItems() {
+    for (auto const& item : g_touchedDayItems) {
+        try {
+            item.ClearValue(wxc::Control::TemplateProperty());
+            item.ClearValue(wxc::Control::ForegroundProperty());
+        } catch (...) {
+        }
+    }
+    g_touchedDayItems.clear();
+}
+
+void ApplyDayStyle(wxc::CalendarViewDayItem const& item) {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (!DateTimeToYmd(item.Date(), &year, &month, &day)) {
+        return;
+    }
+
+    EnsureHolidayDataForDate(year);
+    const auto kind = ClassifyDate(year, month, day);
+    RememberTouchedItem(item);
+
+    if (kind == DayKind::Normal) {
+        // CalendarView recycles containers. Remove all local values that we may
+        // have attached when this container represented a holiday/workday.
+        item.ClearValue(wxc::Control::TemplateProperty());
+        item.ClearValue(wxc::Control::ForegroundProperty());
+        return;
+    }
+
+    const auto secondary = GetDaySecondaryInfo(item.Date());
+    item.Template(DayTemplate(kind, secondary.text, secondary.special));
+
+    // Do not recolor the native Gregorian number. This keeps Windows' own hover,
+    // selection and today states intact and matches the user's requested style.
+    item.ClearValue(wxc::Control::ForegroundProperty());
+}
+
+void RefreshDayItemsRecursive(wux::DependencyObject const& root,
+                              int depth = 0) {
+    if (!root || depth > 32) {
+        return;
+    }
+
+    if (auto dayItem = root.try_as<wxc::CalendarViewDayItem>()) {
+        ApplyDayStyle(dayItem);
+    }
+
+    int count = 0;
+    try {
+        count = wxmedia::VisualTreeHelper::GetChildrenCount(root);
+    } catch (...) {
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        RefreshDayItemsRecursive(
+            wxmedia::VisualTreeHelper::GetChild(root, i), depth + 1);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Header helpers. Windows' notification center normally keeps CalendarHeader
+// pinned to today. We intentionally update it when CalendarView selection changes.
+// -----------------------------------------------------------------------------
+
